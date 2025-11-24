@@ -1,0 +1,225 @@
+version: '3.8'
+
+services:
+  # Zookeeper - Kafka metadata management
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 5
+      ZOOKEEPER_INIT_LIMIT: 10
+      # Performance tuning
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+    networks:
+      - kafka-network
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+
+  # Kafka Broker - Message streaming platform
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+
+      # Listener configuration
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Topic defaults for high throughput
+      KAFKA_NUM_PARTITIONS: 10
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1  # Single broker setup
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+
+      # Performance optimizations
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824  # 1GB
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      KAFKA_COMPRESSION_TYPE: 'snappy'
+
+      # Network and thread configuration
+      KAFKA_NUM_NETWORK_THREADS: 8
+      KAFKA_NUM_IO_THREADS: 16
+      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600  # 100MB
+
+      # Producer optimizations
+      KAFKA_NUM_REPLICA_FETCHERS: 4
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760  # 10MB
+
+      # Memory allocation
+      KAFKA_HEAP_OPTS: "-Xmx2G -Xms2G"
+
+      # JVM performance tuning
+      KAFKA_JVM_PERFORMANCE_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:G1HeapRegionSize=16M"
+
+      # Offset and transaction settings
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+
+    networks:
+      - kafka-network
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka Topic Initialization
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - kafka-network
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka to be ready...'
+      sleep 10
+
+      echo 'Creating topics...'
+
+      # Create orders-placed topic with high partition count
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic orders-placed \
+        --partitions 50 \
+        --replication-factor 1 \
+        --config compression.type=snappy \
+        --config retention.ms=604800000 \
+        --config segment.bytes=1073741824 \
+        --config min.insync.replicas=1
+
+      # Create orders-validated topic
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic orders-validated \
+        --partitions 50 \
+        --replication-factor 1 \
+        --config compression.type=snappy \
+        --config retention.ms=604800000
+
+      # Create orders-inventory topic
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic orders-inventory \
+        --partitions 30 \
+        --replication-factor 1 \
+        --config compression.type=snappy \
+        --config retention.ms=604800000
+
+      # Create orders-warehouse topic
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic orders-warehouse \
+        --partitions 20 \
+        --replication-factor 1 \
+        --config compression.type=snappy \
+        --config retention.ms=2592000000
+
+      # Create dead letter queue
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic orders-dlq \
+        --partitions 5 \
+        --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      echo 'Topics created successfully'
+
+      # List all topics
+      kafka-topics --list --bootstrap-server kafka:9092
+
+      # Describe orders-placed topic
+      kafka-topics --describe --bootstrap-server kafka:9092 --topic orders-placed
+      "
+
+  # Producer Service - Gin API
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "orders-placed"
+      PORT: "8080"
+      GIN_MODE: "release"
+    networks:
+      - kafka-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Consumer Service - Order processor
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "orders-placed"
+      CONSUMER_GROUP_ID: "order-consumer-group"
+    networks:
+      - kafka-network
+    restart: unless-stopped
+    deploy:
+      replicas: 1  # Scale up for higher throughput
+
+  # Optional: Kafka UI for monitoring
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - kafka-network
+
+networks:
+  kafka-network:
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
